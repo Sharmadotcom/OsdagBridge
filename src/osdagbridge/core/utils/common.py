@@ -966,6 +966,82 @@ KEY_DO_SLS_CRACK_WIDTH      = "design_options_cont.sls.crack_width"
 
 #══════════════DESIGN-OPTIONS-CONT-TAB-KEY-ENDS════════════════════════════════════════════════
 
+# ══════════════ CUSTOM-MODE FIELD REGISTRY ════════════════════════════════════
+# Central registry of all TYPE_MODE_LINE / TYPE_MODE_VALUE and dropdown fields
+# whose mode or selection can be set to "Custom". Used by the Additional Inputs
+# dialog to validate that custom value fields are not empty before saving.
+#
+# All parameter display names are defined as constants to avoid hardcoding strings.
+
+KEY_ADD_DISP_FOOTPATH_PRESSURE  = "Footpath Pressure"
+KEY_ADD_DISP_SEISMIC_DEAD_LOAD  = "Dead Load for Seismic Force"
+KEY_ADD_DISP_SEISMIC_LIVE_LOAD  = "Live Load for Seismic Force"
+KEY_ADD_DISP_GUST_FACTOR        = "Gust Factor, G"
+KEY_ADD_DISP_DRAG_COEFF         = "Drag Coefficient, CD"
+KEY_ADD_DISP_DRAG_COEFF_LL      = "Drag Coefficient against Live Load, CDLL"
+KEY_ADD_DISP_LIFT_COEFF         = "Lift Coefficient, CL"
+KEY_ADD_DISP_SUPER_AREA_ELEV    = "Superstructure Area in Elevation, A1"
+KEY_ADD_DISP_SUPER_AREA_PLAIN   = "Superstructure Area in Plain, A3"
+KEY_ADD_DISP_EXPOSED_FRONTAL    = "Exposed Frontal Area of Live Load, A1LL"
+KEY_ADD_DISP_WIND_ECC_DECK      = "Wind Load Eccentricity from Top of Deck"
+KEY_ADD_DISP_WIND_LL_ECC        = "Wind on Live Load Eccentricity from Top of Deck"
+KEY_ADD_DISP_CAMBER             = "Camber"
+KEY_ADD_DISP_CB_WIDTH           = "Crash Barrier Width"
+KEY_ADD_DISP_CB_HEIGHT          = "Crash Barrier Height"
+KEY_ADD_DISP_CB_DENSITY         = "Crash Barrier Density"
+KEY_ADD_DISP_CB_AREA            = "Crash Barrier Area"
+KEY_ADD_DISP_CB_LOAD            = "Crash Barrier Load"
+KEY_ADD_DISP_MD_WIDTH           = "Median Width"
+KEY_ADD_DISP_MD_HEIGHT          = "Median Height"
+KEY_ADD_DISP_MD_DENSITY         = "Median Density"
+KEY_ADD_DISP_MD_AREA            = "Median Area"
+KEY_ADD_DISP_MD_LOAD            = "Median Load"
+KEY_ADD_DISP_RL_WIDTH           = "Railing Width"
+KEY_ADD_DISP_RL_HEIGHT          = "Railing Height"
+KEY_ADD_DISP_RL_LOAD            = "Railing Load"
+KEY_ADD_DISP_WC_DENSITY         = "Wearing Course Density"
+
+CUSTOM_MODE_TOKENS = {"Custom", "custom", "Customized", "customized"}
+
+# Mapping list of (trigger_widget_key, value_widget_key, display_name_constant)
+CUSTOM_MODE_VALIDATION_MAP = [
+    # MODE_LINE fields: trigger combo is <KEY>.mode, value line-edit is <KEY>.value
+    (KEY_LL_FOOTPATH_PRESSURE + ".mode", KEY_LL_FOOTPATH_PRESSURE + ".value", KEY_ADD_DISP_FOOTPATH_PRESSURE),
+    (KEY_SL_DEAD_LOAD + ".mode",         KEY_SL_DEAD_LOAD + ".value",         KEY_ADD_DISP_SEISMIC_DEAD_LOAD),
+    (KEY_SL_LIVE_LOAD + ".mode",         KEY_SL_LIVE_LOAD + ".value",         KEY_ADD_DISP_SEISMIC_LIVE_LOAD),
+    (KEY_WL_GUST_FACTOR + ".mode",       KEY_WL_GUST_FACTOR + ".value",       KEY_ADD_DISP_GUST_FACTOR),
+    (KEY_WL_DRAG_COEFF + ".mode",        KEY_WL_DRAG_COEFF + ".value",        KEY_ADD_DISP_DRAG_COEFF),
+    (KEY_WL_DRAG_COEFF_LL + ".mode",     KEY_WL_DRAG_COEFF_LL + ".value",     KEY_ADD_DISP_DRAG_COEFF_LL),
+    (KEY_WL_LIFT_COEFF + ".mode",        KEY_WL_LIFT_COEFF + ".value",        KEY_ADD_DISP_LIFT_COEFF),
+    (KEY_WL_SUPER_AREA_ELEV + ".mode",   KEY_WL_SUPER_AREA_ELEV + ".value",   KEY_ADD_DISP_SUPER_AREA_ELEV),
+    (KEY_WL_SUPER_AREA_PLAIN + ".mode",  KEY_WL_SUPER_AREA_PLAIN + ".value",  KEY_ADD_DISP_SUPER_AREA_PLAIN),
+    (KEY_WL_EXPOSED_FRONTAL + ".mode",   KEY_WL_EXPOSED_FRONTAL + ".value",   KEY_ADD_DISP_EXPOSED_FRONTAL),
+    (KEY_WL_WIND_ECC_DECK + ".mode",     KEY_WL_WIND_ECC_DECK + ".value",     KEY_ADD_DISP_WIND_ECC_DECK),
+    (KEY_WL_WIND_LL_ECC + ".mode",       KEY_WL_WIND_LL_ECC + ".value",       KEY_ADD_DISP_WIND_LL_ECC),
+    (KEY_DO_CAMBER + ".mode",            KEY_DO_CAMBER + ".value",            KEY_ADD_DISP_CAMBER),
+    # Railing subtab
+    (KEY_RL_LOAD_MODE,                   KEY_RL_LOAD_VALUE,                   KEY_ADD_DISP_RL_LOAD),
+    (KEY_RL_TYPE,                        KEY_RL_WIDTH,                        KEY_ADD_DISP_RL_WIDTH),
+    (KEY_RL_TYPE,                        KEY_RL_HEIGHT,                       KEY_ADD_DISP_RL_HEIGHT),
+    # Wearing course subtab
+    (KEY_WC_MATERIAL,                    KEY_WC_DENSITY,                      KEY_ADD_DISP_WC_DENSITY),
+    # Crash barrier subtab
+    (KEY_CB_TYPE,                        KEY_CB_WIDTH,                        KEY_ADD_DISP_CB_WIDTH),
+    (KEY_CB_TYPE,                        KEY_CB_HEIGHT,                       KEY_ADD_DISP_CB_HEIGHT),
+    (KEY_CB_TYPE,                        KEY_CB_DENSITY,                      KEY_ADD_DISP_CB_DENSITY),
+    (KEY_CB_TYPE,                        KEY_CB_AREA,                         KEY_ADD_DISP_CB_AREA),
+    (KEY_CB_TYPE,                        KEY_CB_LOAD,                         KEY_ADD_DISP_CB_LOAD),
+    # Median subtab
+    (KEY_MD_TYPE,                        KEY_MD_WIDTH,                        KEY_ADD_DISP_MD_WIDTH),
+    (KEY_MD_TYPE,                        KEY_MD_HEIGHT,                       KEY_ADD_DISP_MD_HEIGHT),
+    (KEY_MD_TYPE,                        KEY_MD_DENSITY,                      KEY_ADD_DISP_MD_DENSITY),
+    (KEY_MD_TYPE,                        KEY_MD_AREA,                         KEY_ADD_DISP_MD_AREA),
+    (KEY_MD_TYPE,                        KEY_MD_LOAD,                         KEY_ADD_DISP_MD_LOAD),
+]
+
+CUSTOM_MODE_FIELDS = {item[0]: item[2] for item in CUSTOM_MODE_VALIDATION_MAP}
+# ══════════════ CUSTOM-MODE FIELD REGISTRY END ════════════════════════════════
+
 KEY_METALLIC_CRASH_BARRIER_TYPE = ["Single W-beam", "Double W-beam"]
 KEY_RIGID_CRASH_BARRIER_TYPE = ["IRC-5R", "High Containment"]
 KEY_CRASH_BARRIER_TYPE = ["Flexible", "Semi-Rigid", "Rigid"]

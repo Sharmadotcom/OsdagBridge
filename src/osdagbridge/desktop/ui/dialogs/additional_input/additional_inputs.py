@@ -2,12 +2,19 @@
 Additional Inputs Widget for Highway Bridge Design
 Provides detailed input fields for manual bridge parameter definition
 """
+import sys
+from pathlib import Path
+
+# Ensure src is on sys.path if run directly as a script
+_SRC_DIR = Path(__file__).resolve().parents[4]
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
+
 from copy import deepcopy
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QTabBar, QLabel, QLineEdit,
-    QComboBox, QPushButton, QCheckBox, QSizePolicy,
-    QDialog, QSizePolicy, QSizeGrip,
+    QComboBox, QPushButton, QCheckBox, QSizePolicy, QDialog, QSizeGrip,
 )
 from PySide6.QtCore import Qt, Signal, QTimer, QPoint, QEvent
 from PySide6.QtGui import QDoubleValidator
@@ -18,10 +25,9 @@ from osdagbridge.desktop.ui.utils.custom_titlebar import CustomTitleBar
 from osdagbridge.desktop.ui.dialogs.tabs.common import apply_field_style, create_action_button_bar
 from osdagbridge.desktop.ui.dialogs.custom_messagebox import CustomMessageBox, MessageBoxType
 from osdagbridge.desktop.ui.utils.custom_widgets import SmartCursorComboBoxView
-from osdagbridge.desktop.ui.dialogs.additional_input.ui_builder.common_ui_builder import UIBuilder
 from osdagbridge.core.bridge_types.plate_girder.ui_fields_additional_input import ADDITIONAL_INPUTS_SCHEMA
 from osdagbridge.desktop.ui.dialogs.additional_input.ui_builder._load_combination_widget import LoadCombinationWidget
-from osdagbridge.desktop.ui.dialogs.additional_input.ui_builder.common_ui_builder import AdaptiveWidget
+from osdagbridge.desktop.ui.dialogs.additional_input.ui_builder.common_ui_builder import UIBuilder, AdaptiveWidget
 
 # =================================================================================
 #   MAIN IMPLEMENTATION
@@ -50,6 +56,10 @@ class AdditionalInputs(QDialog):
         self.working_input_dict = {}
         # Last confirmed-good spacing and girder count; restored if solver raises an error
         self._last_good_layout: dict = {}
+
+        # Tracks whether any input has been modified since the last save.
+        # Set True by _on_field_edited / _on_field_editing; reset by _save_inputs.
+        self.is_modified: bool = False
 
         # TO tract additional input is opened first time or not.
         # This is required for end connectors
@@ -177,6 +187,9 @@ class AdditionalInputs(QDialog):
         # Normalize existing numeric text to 2 decimal places for consistent display
         self._normalize_numeric_texts(2)
 
+        # Fresh UI built — reset modified flag
+        self.is_modified = False
+
         # self._print_widget_tree()
 
     # Print Additional Inputs Widget Tree--------------------------------------------
@@ -240,6 +253,9 @@ class AdditionalInputs(QDialog):
             KEY_TS_GIRDER_SPACING: self.working_input_dict.get(KEY_TS_GIRDER_SPACING),
             KEY_TS_NO_OF_GIRDERS:  self.working_input_dict.get(KEY_TS_NO_OF_GIRDERS),
         }
+
+        # Fresh load — no unsaved changes
+        self.is_modified = False
 
         if self.interacted_first:
             self.interacted_first = False
@@ -497,6 +513,8 @@ class AdditionalInputs(QDialog):
 
             self.working_input_dict[name] = value
 
+        self.is_modified = True
+
     def showEvent(self, event):  # Qt event: refreshes active sub-tabs when dialog is shown or reopened
         super().showEvent(event)
         from PySide6.QtWidgets import QTabWidget
@@ -507,6 +525,18 @@ class AdditionalInputs(QDialog):
     # ── Dialog Persistence ───────────────────────────────────────────────────────
 
     def _save_inputs(self):  # on_change: validates all tabs then commits working_input_dict and emits CAD update signal
+
+        # ── Pre-save validation: reject empty Custom fields ───────────────
+        errors = self._validate_custom_fields()
+        if errors:
+            message = errors[0] if len(errors) == 1 else "\n\n".join(errors)
+            CustomMessageBox(
+                title="Validation Error",
+                text=message,
+                buttons=["OK"],
+                dialogType=MessageBoxType.Critical,
+            ).exec()
+            return
 
         # Flush the currently-displayed stiffener member's widgets before committing.
         # _save_stiffener_member_data otherwise only runs when switching *away* from a
@@ -521,6 +551,9 @@ class AdditionalInputs(QDialog):
         cad = self.findChild(CrossSectionCADWidget, KEY_TS_CAD_PREVIEW)
         if cad:
             self.update_template_page_2d_cad.emit(cad.params)
+
+        # Reset modified flag after successful save
+        self.is_modified = False
         
         CustomMessageBox(
             title="Saved",
@@ -538,6 +571,87 @@ class AdditionalInputs(QDialog):
             dialogType=MessageBoxType.Warning,
         ).exec()
 
+    def _is_widget_in_active_tab(self, widget: QWidget) -> bool:  # utility: checks if widget is inside currently active/enabled tabs
+        """Check if widget is contained within enabled tabs and sub-tabs."""
+        curr = widget
+        while curr is not None and curr is not self:
+            parent = curr.parentWidget()
+            if isinstance(parent, QTabWidget):
+                idx = parent.indexOf(curr)
+                if idx != -1 and not parent.isTabEnabled(idx):
+                    return False
+            elif parent is not None and isinstance(parent.parentWidget(), QTabWidget):
+                tab_widget = parent.parentWidget()
+                idx = tab_widget.indexOf(curr)
+                if idx != -1 and not tab_widget.isTabEnabled(idx):
+                    return False
+            curr = parent
+        return True
+
+    def _validate_custom_fields(self) -> list[str]:  # validation: checks all MODE_LINE/dropdown fields with mode set to Custom for empty values
+        """Check every registered Custom-mode field across all active tabs.
+
+        Returns a list of error strings — one per field whose mode combo
+        or selection is set to a custom token but whose value line-edit is empty.
+        Uses the central keys from CUSTOM_MODE_VALIDATION_MAP in common.py.
+        """
+        errors: list[str] = []
+        for trigger_key, value_key, disp_name in CUSTOM_MODE_VALIDATION_MAP:
+            trigger_widget = self.findChild(QWidget, trigger_key)
+            if trigger_widget is None or not self._is_widget_in_active_tab(trigger_widget):
+                continue
+
+            is_custom = False
+            if isinstance(trigger_widget, QComboBox):
+                is_custom = trigger_widget.currentText().strip() in CUSTOM_MODE_TOKENS
+            elif isinstance(trigger_widget, QCheckBox):
+                is_custom = trigger_widget.isChecked()
+            elif isinstance(trigger_widget, QLineEdit):
+                is_custom = trigger_widget.text().strip() in CUSTOM_MODE_TOKENS
+
+            if not is_custom:
+                continue
+
+            value_widget = self.findChild(QLineEdit, value_key)
+            if value_widget is None or not self._is_widget_in_active_tab(value_widget):
+                continue
+
+            # If the value input is disabled by UI gating or hidden, skip
+            if not value_widget.isEnabled() or value_widget.isHidden():
+                continue
+
+            if not value_widget.text().strip():
+                errors.append(
+                    f"Error: The custom value for '{disp_name}' cannot be empty."
+                )
+        return errors
+
+    # ── Unsaved Changes Warning ──────────────────────────────────────────────
+
+    def closeEvent(self, event):  # Qt event: warns when unsaved changes would be lost
+        """Override QDialog.closeEvent to prompt before discarding unsaved edits."""
+        if self.is_modified:
+            dlg = CustomMessageBox(
+                title="Warning",
+                text=(
+                    "You have unsaved changes. Closing this window will "
+                    "discard them. Do you want to proceed?"
+                ),
+                buttons=["Discard", "Cancel"],
+                dialogType=MessageBoxType.Warning,
+            )
+            result = dlg.exec()
+            if result != "Discard":
+                event.ignore()
+                return
+            # User chose Discard — revert working dict to last-saved state
+            self.working_input_dict = deepcopy(self.default_input_dict)
+            self.is_modified = False
+        super().closeEvent(event)
+
+    def reject(self):  # Qt event: route Escape key and rejection through closeEvent
+        self.close()
+
     # ── Field Change Handling ────────────────────────────────────────────────────
 
     def _on_field_edited(self, key: str, widget: QLineEdit | str | dict):  # on_change: hard-validates and commits a field value after editing finishes
@@ -546,6 +660,7 @@ class AdditionalInputs(QDialog):
         - QComboBox: always valid, skip validation, update dict + CAD.
         - QLineEdit: hard validation — corrects widget + input_dict if invalid, shows popup.
         """
+        self.is_modified = True
         if isinstance(widget, str):
             self._update_input_dict(key, widget)
             self._update_additional_input_cad()
@@ -584,6 +699,7 @@ class AdditionalInputs(QDialog):
         self._update_additional_input_cad()
 
     def _on_field_editing(self, current_text: str, key: str):  # on_change: soft validation while typing — updates dict/CAD only when valid, no popups
+        self.is_modified = True
         if not current_text.strip():
             self._update_input_dict(key, "")
             self._update_additional_input_cad()
@@ -1305,6 +1421,7 @@ class AdditionalInputs(QDialog):
         girder_key = f"{KEY_MP_GD_SEGMENT_TABLE}.G{idx + 1}"
 
         self.working_input_dict[girder_key] = segments
+        self.is_modified = True
 
         cad = self.findChild(QWidget, KEY_MP_GD_CAD_PREVIEW)
         cad.update_segments(segments)
@@ -3069,3 +3186,22 @@ class AdditionalInputs(QDialog):
                 line_edit.setText(fmt.format(val))
             except ValueError:
                 continue
+
+if __name__ == "__main__":
+    from PySide6.QtWidgets import QApplication
+    app = QApplication(sys.argv)
+    from osdagbridge.core.bridge_types.plate_girder.defaults import BASIC_INPUT_DICT, solve_extend_basic_input_dict
+    from osdagbridge.core.utils.common import KEY_SPAN, KEY_CARRIAGEWAY_WIDTH, KEY_FOOTPATH, KEY_INCLUDE_MEDIAN
+
+    d = dict(BASIC_INPUT_DICT)
+    d[KEY_SPAN] = 30.0
+    d[KEY_CARRIAGEWAY_WIDTH] = 7.5
+    d[KEY_FOOTPATH] = "None"
+    d[KEY_INCLUDE_MEDIAN] = "No"
+    solve_extend_basic_input_dict(d)
+
+    dlg = AdditionalInputs()
+    dlg.set_input_dictionary(d)
+    dlg.show()
+    sys.exit(app.exec())
+
