@@ -140,16 +140,19 @@ class SummaryOverlay(QFrame):
         title = "Extreme Values Summary"
         if unit:
             title += f" ({unit})"
-        hud_text = f"<b>{title}</b><br>" + "-" * 38 + "<br>"
 
-        h_girder = "Girder".ljust(8).replace(" ", "&nbsp;")
+        col_w = max(8, max((len(str(k)) for k in summary_data), default=8))
+        sep_len = col_w + 28
+        hud_text = f"<b>{title}</b><br>" + "-" * sep_len + "<br>"
+
+        h_member = "Member".ljust(col_w).replace(" ", "&nbsp;")
         h_max = "Max".rjust(10).replace(" ", "&nbsp;")
         h_min = "Min".rjust(12).replace(" ", "&nbsp;")
         
-        hud_text += f"<b>{h_girder}</b> | <span style='color: #FF4136;'><b>{h_max}</b></span> | <span style='color: #00E5FF;'><b>{h_min}</b></span><br>" + "-" * 38 + "<br>"
+        hud_text += f"<b>{h_member}</b> | <span style='color: #FF4136;'><b>{h_max}</b></span> | <span style='color: #00E5FF;'><b>{h_min}</b></span><br>" + "-" * sep_len + "<br>"
 
-        for girder, vals in summary_data.items():
-            g_str = girder.ljust(8).replace(" ", "&nbsp;")
+        for member, vals in summary_data.items():
+            g_str = str(member).ljust(col_w).replace(" ", "&nbsp;")
             max_str = f"{vals['max']:.2f}".rjust(10).replace(" ", "&nbsp;")
             min_str = f"{vals['min']:.2f}".rjust(12).replace(" ", "&nbsp;")
             
@@ -500,6 +503,19 @@ class MplPlotWidget(QWidget):
             return
         self.update_plot()
 
+    @staticmethod
+    def _set_ax_box_aspect(ax, aspect, zoom=None):
+        """Safely set box aspect and optional optical zoom on 3D axes without type checker warnings."""
+        if hasattr(ax, "set_box_aspect"):
+            fn = getattr(ax, "set_box_aspect")
+            if zoom is not None:
+                try:
+                    fn(aspect=aspect, zoom=zoom)
+                except TypeError:
+                    fn(aspect=aspect)
+            else:
+                fn(aspect=aspect)
+
     def _current_member(self):
         if self._output_dock is None:
             return "All"
@@ -603,7 +619,7 @@ class MplPlotWidget(QWidget):
                     cur_aspect = None
                 if cur_aspect is None:
                     cur_aspect = (2.5, 1.2, 1.0)
-                ax.set_box_aspect(aspect=cur_aspect, zoom=self._zoom_scale)
+                self._set_ax_box_aspect(ax, cur_aspect, zoom=self._zoom_scale)
 
             # (Keep your existing anti-clipping loop here)
             for line in ax.lines:
@@ -617,6 +633,8 @@ class MplPlotWidget(QWidget):
 
             # Removed scale label from subtitle - will add as tooltip instead
             subtitle = f"Load Case/Combination : {loadcase}"
+            if sel_girder and sel_girder != "All":
+                subtitle += f" | {sel_girder}"
             self._title_overlay.update_text(title, subtitle)
             self._position_title_overlay()
 
@@ -723,7 +741,8 @@ class MplPlotWidget(QWidget):
             if self._fig.axes:
                 title = self._fig.axes[0].get_title()
                 self._fig.axes[0].set_title("")
-                self._title_overlay.update_text(title)
+                subtitle = f"Member : {sel_girder}" if sel_girder and sel_girder != "All" else ""
+                self._title_overlay.update_text(title, subtitle)
                 self._position_title_overlay()
             
             self._apply_node_visibility()
@@ -735,7 +754,8 @@ class MplPlotWidget(QWidget):
             self._summary_overlay.hide()
             
             if self._fig.axes and hasattr(self._fig.axes[0], 'set_box_aspect'):
-                self._fig.axes[0].set_box_aspect(
+                self._set_ax_box_aspect(
+                    self._fig.axes[0],
                     aspect=(2.5, 1.2, 1.0),
                     zoom=self._zoom_scale,
                 )
@@ -1037,7 +1057,7 @@ class MplPlotWidget(QWidget):
                 cur_aspect = None
             if cur_aspect is None:
                 cur_aspect = (2.5, 1.2, 1.0)
-            ax.set_box_aspect(aspect=cur_aspect, zoom=self._zoom_scale)
+            self._set_ax_box_aspect(ax, cur_aspect, zoom=self._zoom_scale)
             
         self._canvas.draw_idle()
 
@@ -1067,7 +1087,7 @@ class MplPlotWidget(QWidget):
                 cur_aspect = None
             if cur_aspect is None:
                 cur_aspect = (2.5, 1.2, 1.0)
-            ax.set_box_aspect(aspect=cur_aspect, zoom=fit_zoom)
+            self._set_ax_box_aspect(ax, cur_aspect, zoom=fit_zoom)
             ax.autoscale()
         else:  # 2D
             ax.relim()

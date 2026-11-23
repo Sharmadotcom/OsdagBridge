@@ -12,18 +12,25 @@ import openseespy.opensees as ops
 from mpl_toolkits.mplot3d.art3d import Line3DCollection
 from mpl_toolkits.mplot3d import proj3d
 from matplotlib.text import Annotation
+import importlib
 try:
-    import mplcursors
+    mplcursors = importlib.import_module("mplcursors")
     _MPLCURSORS = True
-except ImportError:
+except (ImportError, ModuleNotFoundError):
+    mplcursors = None
     _MPLCURSORS = False
+
+from .results_data import extract_member_diagram_data
 
 # Force component map
 FORCE_MAP = {
     "Fx": ("Vx_i", "Vx_j"),
     "Fy": ("Vy_i", "Vy_j"),
     "Fz": ("Vz_i", "Vz_j"),
+    "Vy": ("Vy_i", "Vy_j"),
+    "Vz": ("Vz_i", "Vz_j"),
     "Mx": ("Mx_i", "Mx_j"),
+    "Tx": ("Mx_i", "Mx_j"),
     "My": ("My_i", "My_j"),
     "Mz": ("Mz_i", "Mz_j"),
 }
@@ -35,7 +42,8 @@ FORCE_MAP = {
 #   Mx -> torsion T_x,      My/Mz -> bending M_y/M_z.
 FORCE_DISPLAY = {
     "Fx": "F$_x$", "Fy": "V$_y$", "Fz": "V$_z$",
-    "Mx": "T$_x$", "My": "M$_y$", "Mz": "M$_z$",
+    "Vy": "V$_y$", "Vz": "V$_z$",
+    "Mx": "T$_x$", "Tx": "T$_x$", "My": "M$_y$", "Mz": "M$_z$",
 }
 
 # Displacement component map  key → component name in ds["displacements"]
@@ -375,7 +383,14 @@ def _add_coordinate_triad(ax, nodes, scale=0.12, eng_scale: float = 1.0):
     ax.set_zlim(zlim)
     
 def _get_bg_nodes_members(nodes, members, edge_dist, selected_girder, girder_items):
-    if selected_girder == "All":
+    is_trans = (
+        selected_girder in ("All", "Transverse Members", "End Diaphragms", "Intermediate Cross Bracings")
+        or "Diaphragm" in selected_girder
+        or "Cross Bracing" in selected_girder
+        or selected_girder.startswith("ED")
+        or selected_girder.startswith("CB")
+    )
+    if is_trans:
         return nodes, members
     filtered_nodes = {}
     filtered_members = {}
@@ -395,6 +410,14 @@ def _add_supports(ax, nodes, members, edge_dist=0.0, selected_girder="All"):
     girder_items = list(girders.items())
     n_girders = len(girder_items)
 
+    is_trans = (
+        selected_girder in ("Transverse Members", "End Diaphragms", "Intermediate Cross Bracings")
+        or "Diaphragm" in selected_girder
+        or "Cross Bracing" in selected_girder
+        or selected_girder.startswith("ED")
+        or selected_girder.startswith("CB")
+    )
+
     pin_x, pin_z = [], []
     rol_x, rol_z = [], []
 
@@ -402,7 +425,7 @@ def _add_supports(ax, nodes, members, edge_dist=0.0, selected_girder="All"):
         if not elems: continue
         
         girder_name = f"G{i}" if edge_dist > 0 else f"G{i + 1}"
-        if selected_girder != "All" and girder_name != selected_girder:
+        if not is_trans and selected_girder != "All" and girder_name != selected_girder:
             continue
 
         # Skip placing supports on edge beams if an overhang exists!
@@ -683,14 +706,22 @@ def build_figure_sfd(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0
     girder_items  = list(girders.items())
     n_girders     = len(girder_items)
 
+    is_trans_mode = (
+        selected_girder in ("Transverse Members", "End Diaphragms", "Intermediate Cross Bracings")
+        or "Diaphragm" in selected_girder
+        or "Cross Bracing" in selected_girder
+        or selected_girder.startswith("ED")
+        or selected_girder.startswith("CB")
+    )
+
     bg_nodes, bg_members = _get_bg_nodes_members(nodes, members, edge_dist, selected_girder, girder_items)
 
     _add_grillage_background(
         ax, bg_nodes, bg_members,
-        show_transverse=False,
-        include_edge_longitudinals=False,
-        include_end_transverse=False,
-        show_inner_nodes=False,
+        show_transverse=is_trans_mode,
+        include_edge_longitudinals=is_trans_mode,
+        include_end_transverse=True,
+        show_inner_nodes=is_trans_mode,
     )
     
     shear_color = "#1565C0"
@@ -700,48 +731,48 @@ def build_figure_sfd(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0
     _scatter_objs = []
     _scatter_data = {}
 
-    summary_data = {}
+    polylines, summary_data = extract_member_diagram_data(
+        ds, selected_girder, force_key, nodes, members, edge_dist=edge_dist
+    )
+
     # Track global scaled value range for z-limits so 0 stays a visible baseline
     # and the 3D "grid" can expand/shrink with v_scale.
     global_vmin = 0.0
     global_vmax = 0.0
 
-    for i, (z_val, elems) in enumerate(girder_items):
-        is_edge_beam = edge_dist > 0 and (i == 0 or i == n_girders - 1)
-        girder_name  = f"G{i}" if edge_dist > 0 else f"G{i + 1}"
-
-        if selected_girder != "All" and girder_name != selected_girder:
+    for i, p in enumerate(polylines):
+        if p["is_edge"]:
             continue
 
-        xs, ys, zs, Vy, node_ids = _build_polyline(
-            elems, members, nodes, comp_i_name, comp_j_name, ds
-        )
-
-        Vy = Vy.copy()
-        Vy[-1] = -Vy[-1]
+        Vy = p["vals"]
         Vy_geom = Vy * v_scale
-        if (not is_edge_beam) and Vy_geom.size:
+        if Vy_geom.size:
             global_vmin = min(global_vmin, float(np.min(Vy_geom)))
             global_vmax = max(global_vmax, float(np.max(Vy_geom)))
 
-        z_base = float(np.mean(zs))
-        z_arr  = np.full_like(xs, z_base)
+        xs = p["xs"]
+        zs = p["zs"]
+        node_ids = p["node_ids"]
+        is_trans = p["is_transverse"]
+        line_name = p["name"]
 
-        if is_edge_beam:
-            continue
-
-        ax.scatter(xs, z_arr, np.zeros_like(xs),
+        ax.scatter(xs, zs, np.zeros_like(xs),
                    color=base_color, s=5, zorder=4, depthshade=False, alpha=0.4)
 
-        dynamic_zorder = 100 - i  
-        ax.text(xs[0] - (x_range * 0.02), z_base, 0, f"{girder_name}",
-                color="black", fontsize=13, ha="right", va="center",
-                zorder=dynamic_zorder, gid="girder_labels")
+        dynamic_zorder = 100 - (i % 50)
+        if not is_trans:
+            ax.text(xs[0] - (x_range * 0.02), zs[0], 0, f"{line_name}",
+                    color="black", fontsize=13, ha="right", va="center",
+                    zorder=dynamic_zorder, gid="girder_labels")
+        else:
+            ax.text(xs[0], zs[0] - (z_range * 0.03), 0, f"{line_name}",
+                    color="black", fontsize=8, fontweight="bold", ha="center", va="top",
+                    zorder=dynamic_zorder, gid="girder_labels")
 
         x_step  = np.repeat(xs, 2)[1:-1]
+        z_step  = np.repeat(zs, 2)[1:-1]
         Vy_step = np.repeat(Vy_geom[:-1], 2)
         y_step  = Vy_step
-        z_step  = np.full_like(x_step, z_base)
 
         ax.plot_surface(
             np.vstack([x_step, x_step]),
@@ -752,23 +783,18 @@ def build_figure_sfd(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0
 
         ax.plot(x_step, z_step, y_step, color=shear_color, linewidth=2.0, zorder=4)
 
-        for xi, vyi_geom in zip(xs, Vy_geom):
-            ax.plot([xi, xi], [z_base, z_base], [0, vyi_geom],
+        for xi, zi, vyi_geom in zip(xs, zs, Vy_geom):
+            ax.plot([xi, xi], [zi, zi], [0, vyi_geom],
                     color=shear_color, linewidth=1.2, alpha=0.7, zorder=3)
 
-        sc = ax.scatter(xs, z_arr, Vy_geom,
+        sc = ax.scatter(xs, zs, Vy_geom,
                         color=shear_color, s=30, zorder=5, depthshade=False)
         _scatter_objs.append(sc)
-        _scatter_data[id(sc)] = (node_ids, xs, Vy)
+        _scatter_data[id(sc)] = (node_ids, xs, zs, Vy)
 
         if len(Vy) > 0:
             idx_max = int(np.argmax(Vy))
             idx_min = int(np.argmin(Vy))
-
-            summary_data[girder_name] = {
-                "max": float(Vy[idx_max]),
-                "min": float(Vy[idx_min])
-            }
 
             # ==========================================
             # CLEANED Extreme Value Logic (Nodes and Text)
@@ -778,22 +804,22 @@ def build_figure_sfd(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0
             extreme_align_color = "black"
 
             # Max Node Highlight and Text (Highest Positive)
-            ax.plot([xs[idx_max]], [z_base], [Vy_geom[idx_max]],
+            ax.plot([xs[idx_max]], [zs[idx_max]], [Vy_geom[idx_max]],
                     marker="o", markersize=9, color=extreme_align_color, markeredgecolor="white", markeredgewidth=1.5, 
                     linestyle="None", zorder=10, gid="max_line")
             
             # CLEAN: Removed "Max:" prefix.
-            ax.text(xs[idx_max], z_base, Vy_geom[idx_max], f" {Vy[idx_max]:.3f} kN",
+            ax.text(xs[idx_max], zs[idx_max], Vy_geom[idx_max], f" {Vy[idx_max]:.3f} kN",
                     color=extreme_align_color, fontsize=7, fontweight="bold", ha="left", va="bottom", zorder=11,
                     gid="max_line", bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.8, edgecolor="none"))
 
             # Min Node Highlight and Text (Lowest Negative)
-            ax.plot([xs[idx_min]], [z_base], [Vy_geom[idx_min]],
+            ax.plot([xs[idx_min]], [zs[idx_min]], [Vy_geom[idx_min]],
                     marker="o", markersize=9, color=extreme_align_color, markeredgecolor="white", markeredgewidth=1.5, 
                     linestyle="None", zorder=10, gid="min_line")
             
             # CLEAN: Removed "Min:" prefix.
-            ax.text(xs[idx_min], z_base, Vy_geom[idx_min], f" {Vy[idx_min]:.3f} kN",
+            ax.text(xs[idx_min], zs[idx_min], Vy_geom[idx_min], f" {Vy[idx_min]:.3f} kN",
                     color=extreme_align_color, fontsize=7, fontweight="bold", ha="right", va="top", zorder=11,
                     gid="min_line", bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.8, edgecolor="none"))
 
@@ -806,7 +832,7 @@ def build_figure_sfd(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0
                     v_align = "bottom" if j % 2 == 0 else "top"
                     h_align = "left" if i % 2 == 0 else "right" 
 
-                    ax.text(xs[j], z_base, Vy_geom[j], 
+                    ax.text(xs[j], zs[j], Vy_geom[j], 
                             f" {Vy[j]:.3f} kN", 
                             color=standard_gray, fontsize=7, ha=h_align, va=v_align, zorder=6, 
                             gid="all_vals", bbox=dict(boxstyle="round,pad=0.1", facecolor="white", alpha=0.7, edgecolor="none"))
@@ -824,10 +850,10 @@ def build_figure_sfd(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0
 
         @cursor.connect("add")
         def on_add(sel, _data=_scatter_data, _fk=disp_key):
-            nids, xs_g, vals_g = _data[id(sel.artist)]
+            nids, xs_g, zs_g, vals_g = _data[id(sel.artist)]
             idx = sel.index
             sel.annotation.set_text(
-                f"Node {nids[idx]}\nX: {xs_g[idx]:.2f}\n{_fk}: {vals_g[idx]:.3f} kN"
+                f"Node {nids[idx]}\nX: {xs_g[idx]:.2f} m\nZ: {zs_g[idx]:.2f} m\n{_fk}: {vals_g[idx]:.3f} kN"
             )
             sel.annotation.get_bbox_patch().set(fc="white", alpha=0.9, edgecolor="#BBBBBB")
 
@@ -936,121 +962,118 @@ def build_figure_bmd(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0
     girder_items_bmd = list(girders.items())
     n_girders_bmd    = len(girder_items_bmd)
 
+    is_trans_mode = (
+        selected_girder in ("Transverse Members", "End Diaphragms", "Intermediate Cross Bracings")
+        or "Diaphragm" in selected_girder
+        or "Cross Bracing" in selected_girder
+        or selected_girder.startswith("ED")
+        or selected_girder.startswith("CB")
+    )
+
     bg_nodes, bg_members = _get_bg_nodes_members(nodes, members, edge_dist, selected_girder, girder_items_bmd)
 
     _add_grillage_background(
         ax, bg_nodes, bg_members,
-        show_transverse=False,
-        include_edge_longitudinals=False,
-        include_end_transverse=False,
-        show_inner_nodes=False,
+        show_transverse=is_trans_mode,
+        include_edge_longitudinals=is_trans_mode,
+        include_end_transverse=True,
+        show_inner_nodes=is_trans_mode,
     )
 
     moment_color = "#C62828"
     fill_color   = "#EF9A9A"
     base_color   = "#388E3C"
 
-    summary_data  = {}
     _scatter_objs = []
     _scatter_data = {}
+
+    polylines, summary_data = extract_member_diagram_data(
+        ds, selected_girder, force_key, nodes, members, edge_dist=edge_dist
+    )
 
     # Track global scaled z-range for baseline at 0 and cube resizing.
     global_vmin = 0.0
     global_vmax = 0.0
-    for i, (z_val, elems) in enumerate(girder_items_bmd):
-        is_edge_beam = edge_dist > 0 and (i == 0 or i == n_girders_bmd - 1)
-        girder_name  = f"G{i}" if edge_dist > 0 else f"G{i + 1}"
-
-        if selected_girder != "All" and girder_name != selected_girder:
+    for i, p in enumerate(polylines):
+        if p["is_edge"]:
             continue
 
-        xs, ys, zs, Mz, node_ids = _build_polyline(
-            elems, members, nodes, comp_i_name, comp_j_name, ds
-        )
+        Mz = p["vals"]
+        xs = p["xs"]
+        zs = p["zs"]
+        node_ids = p["node_ids"]
+        is_trans = p["is_transverse"]
+        line_name = p["name"]
 
-        z_base = float(np.mean(zs))
-        z_arr  = np.full_like(xs, z_base)
-
-        # baseline (solid) - grey for edge beams, green for structural
-        # ax.plot([xs[0], xs[-1]], [z_base, z_base], [0, 0],
-        #         color="slategrey" if is_edge_beam else base_color,
-        #         linewidth=1.0, alpha=0.3, zorder=3)
-
-        # edge beams: baseline only, no markers / label / force diagram
-        if is_edge_beam:
-            continue
-
-        ax.scatter(xs, z_arr, np.zeros_like(xs),
+        ax.scatter(xs, zs, np.zeros_like(xs),
                    color=base_color, s=5, zorder=4, depthshade=False, alpha=0.4)
 
-        # girder label
         # 1. Reverse the stack: G1 (i=0) gets zorder 100, G2 gets 99, etc.
-        dynamic_zorder = 100 - i  
+        dynamic_zorder = 100 - (i % 50)
         
+        if not is_trans:
+            ax.text(xs[0] - (x_range * 0.02), zs[0], 0, f"{line_name}",
+                    color="black", fontsize=13, ha="right", va="center",
+                    zorder=dynamic_zorder, gid="girder_labels")
+        else:
+            ax.text(xs[0], zs[0] - (z_range * 0.03), 0, f"{line_name}",
+                    color="black", fontsize=8, fontweight="bold", ha="center", va="top",
+                    zorder=dynamic_zorder, gid="girder_labels")
 
-        ax.text(xs[0] - (x_range * 0.02), z_base, 0, f"{girder_name}",
-                color="black", fontsize=13, ha="right", va="center",
-                zorder=dynamic_zorder, gid="girder_labels")
-
-        # val_range = max(Mz) - min(Mz)
-        # if val_range == 0:
-        #     moment_scale = 1.0 if max(Mz) == 0 else 0.1 * abs((max(xs) - min(xs)) / max(Mz))
-        # else:
-        #     moment_scale = 0.1 * abs((max(xs) - min(xs)) / val_range)
-
-        y_plot = -Mz * v_scale   # negate: positive moment plots downward
+        sign = -1.0 if force_key in ("Mz", "My") else 1.0
+        y_plot = sign * Mz * v_scale   # negate for positive moment plotted downward
         if y_plot.size:
             global_vmin = min(global_vmin, float(np.min(y_plot)))
             global_vmax = max(global_vmax, float(np.max(y_plot)))
 
         ax.plot_surface(
             np.vstack([xs, xs]),
-            np.vstack([z_arr, z_arr]),
+            np.vstack([zs, zs]),
             np.vstack([np.zeros_like(y_plot), y_plot]),
             color=fill_color, alpha=0.25, linewidth=0, antialiased=False, zorder=2
         )
 
-        ax.plot(xs, z_arr, y_plot, color=moment_color, linewidth=2.0, zorder=4)
+        ax.plot(xs, zs, y_plot, color=moment_color, linewidth=2.0, zorder=4)
 
         # Max line (Dashed, Tagged for toggling)
-        idx_max = int(np.argmax(Mz))
-        ax.plot([xs[idx_max], xs[idx_max]], [z_base, z_base], [0, y_plot[idx_max]],
-                color="#FF4136", linewidth=1.5, linestyle="--", zorder=3, gid="max_line")
-        # Bold Dark Grey Text
-        ax.text(xs[idx_max], z_base, y_plot[idx_max],
-                f" {Mz[idx_max]:.2f} kNm", color="#333333", fontsize=8, fontweight="bold", zorder=6, gid="max_line",
-                bbox=dict(facecolor='white', edgecolor='none', alpha=0.85, pad=1.0))
+        if len(Mz) > 0:
+            idx_max = int(np.argmax(Mz))
+            ax.plot([xs[idx_max], xs[idx_max]], [zs[idx_max], zs[idx_max]], [0, y_plot[idx_max]],
+                    color="#FF4136", linewidth=1.5, linestyle="--", zorder=3, gid="max_line")
+            ax.text(xs[idx_max], zs[idx_max], y_plot[idx_max],
+                    f" {Mz[idx_max]:.2f} kNm", color="#333333", fontsize=8, fontweight="bold", zorder=6, gid="max_line",
+                    bbox=dict(facecolor='white', edgecolor='none', alpha=0.85, pad=1.0))
 
-        # Min line (Dashed, Tagged for toggling)
-        idx_min = int(np.argmin(Mz))
-        ax.plot([xs[idx_min], xs[idx_min]], [z_base, z_base], [0, y_plot[idx_min]],
-                color="#0074D9", linewidth=1.5, linestyle="--", zorder=3, gid="min_line")
-        ax.text(xs[idx_min], z_base, y_plot[idx_min],
-                f" {Mz[idx_min]:.2f} kNm", color="#333333", fontsize=8, fontweight="bold", zorder=6, gid="min_line",
-                bbox=dict(facecolor='white', edgecolor='none', alpha=0.85, pad=1.0))
+            # Min line (Dashed, Tagged for toggling)
+            idx_min = int(np.argmin(Mz))
+            ax.plot([xs[idx_min], xs[idx_min]], [zs[idx_min], zs[idx_min]], [0, y_plot[idx_min]],
+                    color="#0074D9", linewidth=1.5, linestyle="--", zorder=3, gid="min_line")
+            ax.text(xs[idx_min], zs[idx_min], y_plot[idx_min],
+                    f" {Mz[idx_min]:.2f} kNm", color="#333333", fontsize=8, fontweight="bold", zorder=6, gid="min_line",
+                    bbox=dict(facecolor='white', edgecolor='none', alpha=0.85, pad=1.0))
 
-        # 'All' values annotations (Slightly lighter grey, Tagged for toggling)
-        for xi, yi, mzi in zip(xs, y_plot, Mz):
-            ax.text(xi, z_base, yi, f" {mzi:.2f} kNm", color="#555555", fontsize=7, zorder=5, gid="all_vals")
+            # 'All' values annotations (Slightly lighter grey, Tagged for toggling)
+            for xi, zi, yi, mzi in zip(xs, zs, y_plot, Mz):
+                ax.text(xi, zi, yi, f" {mzi:.2f} kNm", color="#555555", fontsize=7, zorder=5, gid="all_vals")
 
-        # Slicing [1:-1] strips away the first and last dots so the supports stay clean!
-        sc = ax.scatter(xs[1:-1], z_arr[1:-1], y_plot[1:-1],
+        sc_xs = xs[1:-1] if len(xs) > 2 else xs
+        sc_zs = zs[1:-1] if len(zs) > 2 else zs
+        sc_yp = y_plot[1:-1] if len(y_plot) > 2 else y_plot
+        sc_nid = node_ids[1:-1] if len(node_ids) > 2 else node_ids
+        sc_mz = Mz[1:-1] if len(Mz) > 2 else Mz
+
+        sc = ax.scatter(sc_xs, sc_zs, sc_yp,
                         color=moment_color, s=30, zorder=5, depthshade=False)
-        
         _scatter_objs.append(sc)
-        
-        # CRITICAL: You must slice the hover data too, or the tooltip will show the wrong node!
-        _scatter_data[id(sc)] = (node_ids[1:-1], xs[1:-1], Mz[1:-1])
-
-        summary_data[girder_name] = {"max": float(max(Mz)), "min": float(min(Mz))}
+        _scatter_data[id(sc)] = (sc_nid, sc_xs, sc_zs, sc_mz)
 
     if _MPLCURSORS and _scatter_objs:
         cursor = mplcursors.cursor(_scatter_objs, hover=True)
-        cursor._timers = {}  # THE FIX: A safe dictionary to store active timers
+        cursor._timers = {}
 
         @cursor.connect("add")
         def on_add(sel, _data=_scatter_data, _fk=disp_key):
-            nids, xs_g, vals_g = _data[id(sel.artist)]
+            nids, xs_g, zs_g, vals_g = _data[id(sel.artist)]
             idx = sel.index
             
             # 1. Dynamically assign the correct engineering unit
@@ -1063,7 +1086,7 @@ def build_figure_bmd(ds, force_key, nodes, members, edge_dist=0.0, eng_scale=1.0
 
             # 2. Apply the dynamic unit to the text
             sel.annotation.set_text(
-                f"Node {nids[idx]}\nX: {xs_g[idx]:.2f}\n{_fk}: {vals_g[idx]:.3f} {unit}"
+                f"Node {nids[idx]}\nX: {xs_g[idx]:.2f} m\nZ: {zs_g[idx]:.2f} m\n{_fk}: {vals_g[idx]:.3f} {unit}"
             )
             
             sel.annotation.get_bbox_patch().set(fc="white", alpha=0.9)
@@ -1310,103 +1333,66 @@ def build_figure_deflection(ds, disp_key, nodes, members, edge_dist=0.0, eng_sca
     girder_items = list(girders.items())
     n_girders    = len(girder_items)
 
+    is_trans_mode = (
+        selected_girder in ("Transverse Members", "End Diaphragms", "Intermediate Cross Bracings")
+        or "Diaphragm" in selected_girder
+        or "Cross Bracing" in selected_girder
+        or selected_girder.startswith("ED")
+        or selected_girder.startswith("CB")
+    )
+
     bg_nodes, bg_members = _get_bg_nodes_members(nodes, members, edge_dist, selected_girder, girder_items)
 
     _add_grillage_background(
         ax, bg_nodes, bg_members,
-        show_transverse=False,
-        include_edge_longitudinals=False,
-        include_end_transverse=False,
-        show_inner_nodes=False,
+        show_transverse=is_trans_mode,
+        include_edge_longitudinals=is_trans_mode,
+        include_end_transverse=True,
+        show_inner_nodes=is_trans_mode,
     )
 
     defl_color = "#6A1B9A"   # deep purple
     base_color = "#388E3C"   # green baseline
 
-    # =========================================================
-    # PHASE 1: FOOLPROOF DATA EXTRACTION (ospgrillage Mapping)
-    # =========================================================
-    disp_dict = {}
-    actual_comp = None
-    
-    # 1A. Map UI input (Dx, Dy) to the correct static displacement key (x, y)
-    # This prevents us from accidentally grabbing the 'velocity' components!
-    _DISP_COMPONENT_MAP = {
-        "dx": "x", "dy": "y", "dz": "z",
-        "Dx": "x", "Dy": "y", "Dz": "z"
-    }
-    target_ds_key = _DISP_COMPONENT_MAP.get(comp_name, comp_name)
-    
-    try:
-        available_comps = [str(c) for c in ds["displacements"].coords["Component"].values]
-        
-        for c in available_comps:
-            if str(c).lower() == target_ds_key.lower():
-                actual_comp = c
-                break
-                
-    except Exception as e:
-        print(f"[DEBUG] Error reading components: {e}")
-
-    # 1B. Extract node values into the dictionary
-    if actual_comp is not None:
-        try:
-            for node_id in ds["displacements"].coords["Node"].values:
-                val = float(ds["displacements"].sel(Node=node_id, Component=actual_comp).values)
-                
-                # Apply the engineering sign flip for vertical sag (Y or Z axis)
-                if actual_comp.lower() in ["y", "z"]:
-                    val = -val 
-                    
-                disp_dict[str(int(node_id))] = val * 1000.0  # Convert to mm
-                
-        except Exception as e:
-            print(f"🚨 [CRITICAL ERROR] Extraction crashed: {e}")
-    else:
-        print(f"[DEBUG] 🚨 CRITICAL: Target '{target_ds_key}' not found in dataset!")
-
-    # =========================================================
-    # PHASE 2: PLOTTING THE DIAGRAM
-    # =========================================================
     _scatter_objs = []
     _scatter_data = {}
-    summary_data = {}
+
+    polylines, summary_data = extract_member_diagram_data(
+        ds, selected_girder, disp_key, nodes, members, edge_dist=edge_dist
+    )
+
     # Track global scaled z-range for baseline at 0 and cube resizing.
     global_vmin = 0.0
     global_vmax = 0.0
 
-    for i, (z_val, elems) in enumerate(girder_items):
-        is_edge_beam = edge_dist > 0 and (i == 0 or i == n_girders - 1)
-        girder_name  = f"G{i}" if edge_dist > 0 else f"G{i + 1}"
-
-        if selected_girder != "All" and girder_name != selected_girder:
+    for i, p in enumerate(polylines):
+        if p["is_edge"]:
             continue
 
-        node_list = [members[e][0] for e in elems] + [members[elems[-1]][1]]
-        xs = np.array([nodes[n][0] for n in node_list])
-        zs = np.array([nodes[n][2] for n in node_list])
-
-        # Fetch from our safe dictionary (defaults to 0.0 if missing)
-        vals  = np.array([disp_dict.get(str(int(n)), 0.0) for n in node_list])
+        vals = p["vals"]
+        xs = p["xs"]
+        zs = p["zs"]
+        node_ids = p["node_ids"]
+        is_trans = p["is_transverse"]
+        line_name = p["name"]
         z_base = float(np.mean(zs))
-        z_arr  = np.full_like(xs, z_base)
+        z_arr = zs if is_trans else np.full_like(xs, z_base)
 
         # Draw Baseline
         # ax.plot([xs[0], xs[-1]], [z_base, z_base], [0, 0],
         #         color="slategrey" if is_edge_beam else base_color,
         #         linewidth=1.0, alpha=0.3, zorder=3)
 
-        if is_edge_beam:
-            continue
+        dynamic_zorder = 100 - (i % 50)
 
-        # Draw Girder Label
-        # 1. Reverse the stack: G1 (i=0) gets zorder 100, G2 gets 99, etc.
-        dynamic_zorder = 100 - i  
-        
-
-        ax.text(xs[0] - (x_range * 0.02), z_base, 0, f"{girder_name}",
-                color="black", fontsize=13, ha="right", va="center",
-                zorder=dynamic_zorder, gid="girder_labels")
+        if not is_trans:
+            ax.text(xs[0] - (x_range * 0.02), z_base, 0, f"{line_name}",
+                    color="black", fontsize=13, ha="right", va="center",
+                    zorder=dynamic_zorder, gid="girder_labels")
+        else:
+            ax.text(xs[0], zs[0] - (z_range * 0.03), 0, f"{line_name}",
+                    color="black", fontsize=8, fontweight="bold", ha="center", va="top",
+                    zorder=dynamic_zorder, gid="girder_labels")
 
         y_plot = vals * v_scale
         if y_plot.size:
@@ -1417,15 +1403,15 @@ def build_figure_deflection(ds, disp_key, nodes, members, edge_dist=0.0, eng_sca
         ax.plot(xs, z_arr, y_plot, color=defl_color, linewidth=2.5, zorder=4)
 
         # Draw Nodes (Pure Black)
-        sc = ax.scatter(xs[1:-1], z_arr[1:-1], y_plot[1:-1], color="black", s=30, zorder=5, depthshade=False)
-        
+        sc_xs = xs[1:-1] if len(xs) > 2 else xs
+        sc_zs = z_arr[1:-1] if len(z_arr) > 2 else z_arr
+        sc_yp = y_plot[1:-1] if len(y_plot) > 2 else y_plot
+        sc_nid = node_ids[1:-1] if len(node_ids) > 2 else node_ids
+        sc_v = vals[1:-1] if len(vals) > 2 else vals
+
+        sc = ax.scatter(sc_xs, sc_zs, sc_yp, color="black", s=30, zorder=5, depthshade=False)
         _scatter_objs.append(sc)
-        _scatter_data[id(sc)] = (node_list[1:-1], xs[1:-1], vals[1:-1])
-        if not is_edge_beam and len(vals) > 0:
-            summary_data[girder_name] = {
-                "max": float(np.max(vals)), # Uplift / Least sag
-                "min": float(np.min(vals))  # Maximum downward deflection
-            }
+        _scatter_data[id(sc)] = (sc_nid, sc_xs, sc_zs, sc_v)
 
         # Annotate maximum deflection
         if len(vals) > 0 and np.max(np.abs(vals)) > 0:
@@ -1443,7 +1429,7 @@ def build_figure_deflection(ds, disp_key, nodes, members, edge_dist=0.0, eng_sca
                     v_align = "bottom" if j % 2 == 0 else "top"
                     h_align = "left" if i % 2 == 0 else "right" 
 
-                    ax.text(xs[j], z_base, y_plot[j], 
+                    ax.text(xs[j], z_arr[j], y_plot[j], 
                             f" {vals[j]:.3f} mm", 
                             color="#455A64", 
                             fontsize=7, 
@@ -1454,16 +1440,16 @@ def build_figure_deflection(ds, disp_key, nodes, members, edge_dist=0.0, eng_sca
                             bbox=dict(boxstyle="round,pad=0.1", facecolor="white", alpha=0.7, edgecolor="none"))
                     
             # 1. Add gid="max_line" to the dotted line
-            ax.plot([xs[idx_max], xs[idx_max]], [z_base, z_base], [0, y_plot[idx_max]],
+            ax.plot([xs[idx_max], xs[idx_max]], [z_arr[idx_max], z_arr[idx_max]], [0, y_plot[idx_max]],
                     color=defl_color, linewidth=1.5, linestyle="--", zorder=3, gid="max_line")
             
             # 2. Add gid="max_line" to the text label
-            ax.text(xs[idx_max], z_base, y_plot[idx_max],
+            ax.text(xs[idx_max], z_arr[idx_max], y_plot[idx_max],
                     f" {vals[idx_max]:.3f} mm", color="#4A4A4A", fontsize=7, fontweight="bold", zorder=6, gid="max_line")
             # 3. Add gid="min_line" to the dotted line
-            ax.plot([xs[idx_min], xs[idx_min]], [z_base, z_base], [0, y_plot[idx_min]],
+            ax.plot([xs[idx_min], xs[idx_min]], [z_arr[idx_min], z_arr[idx_min]], [0, y_plot[idx_min]],
                     color=defl_color, linewidth=1.5, linestyle="--", zorder=3, gid="min_line")
-            ax.text(xs[idx_min], z_base, y_plot[idx_min],
+            ax.text(xs[idx_min], z_arr[idx_min], y_plot[idx_min],
                     f" {vals[idx_min]:.3f} mm", color="#4A4A4A", fontsize=7, fontweight="bold", zorder=6, gid="min_line")
         
         
@@ -1484,10 +1470,10 @@ def build_figure_deflection(ds, disp_key, nodes, members, edge_dist=0.0, eng_sca
 
         @cursor.connect("add")
         def on_add(sel, _data=_scatter_data, _fk=disp_key):
-            nids, xs_g, vals_g = _data[id(sel.artist)]
+            nids, xs_g, zs_g, vals_g = _data[id(sel.artist)]
             idx = sel.index
             sel.annotation.set_text(
-                f"Node {nids[idx]}\nX: {xs_g[idx]:.2f}\n{_fk}: {vals_g[idx]:.3f} mm"
+                f"Node {nids[idx]}\nX: {xs_g[idx]:.2f} m\nZ: {zs_g[idx]:.2f} m\n{_fk}: {vals_g[idx]:.3f} mm"
             )
             sel.annotation.get_bbox_patch().set(fc="white", alpha=0.9, edgecolor="#BBBBBB")
 

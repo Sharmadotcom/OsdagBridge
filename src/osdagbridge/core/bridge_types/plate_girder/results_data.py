@@ -10,10 +10,11 @@ bridge-wrapper dependency.
 
 from __future__ import annotations
 import json
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from collections.abc import Mapping
 from pathlib import Path
 
+import numpy as np
 import openseespy.opensees as ops
 
 from .results_data_post_processing import post_process, FORCE_KEEP, DISP_KEEP
@@ -92,6 +93,460 @@ def _build_nodes_members() -> tuple[dict, dict]:
         for e in ops.getEleTags()
     }
     return nodes, members
+
+
+def classify_grillage_elements(
+    nodes: dict,
+    members: dict,
+    model=None,
+    groups: dict | None = None,
+) -> dict:
+    """
+    Classify grillage elements into longitudinal and transverse members,
+    distinguishing end diaphragms and intermediate cross bracings.
+
+    Parameters
+    ----------
+    nodes   : dict — {node_id: [x, y, z]}
+    members : dict — {elem_id: [n1, n2]}
+    model   : OspGrillage, optional
+    groups  : dict, optional
+
+    Returns
+    -------
+    dict with keys:
+        - "longitudinal_members": list of int element tags
+        - "transverse_members": list of int element tags
+        - "end_diaphragm_members": list of int element tags (start_edge + end_edge)
+        - "cross_bracing_members": list of int element tags (transverse_slab)
+        - "start_edge": list of int element tags
+        - "end_edge": list of int element tags
+        - "transverse_slab": list of int element tags
+        - "groups": dict of group_name -> list of int tags
+    """
+    nodes = {int(k): list(map(float, v)) for k, v in nodes.items()}
+    members = {int(k): list(map(int, v)) for k, v in members.items()}
+
+    grp = dict(groups) if groups else {}
+    standard_groups = [
+        "edge_beam", "exterior_main_beam_1", "exterior_main_beam_2",
+        "interior_main_beam", "start_edge", "end_edge", "transverse_slab",
+        "shell_slab"
+    ]
+    if model is not None:
+        for g_name in standard_groups:
+            if g_name not in grp or not grp[g_name]:
+                try:
+                    grp[g_name] = [int(e) for e in model.get_element(member=g_name, options="elements")]
+                except Exception:
+                    grp.setdefault(g_name, [])
+
+    start_edge = [int(e) for e in grp.get("start_edge", []) if int(e) in members]
+    end_edge = [int(e) for e in grp.get("end_edge", []) if int(e) in members]
+    trans_slab = [int(e) for e in grp.get("transverse_slab", []) if int(e) in members]
+
+    # Geometric classification for all elements
+    longitudinal_members = []
+    transverse_members = []
+    for tag, (n1, n2) in members.items():
+        if n1 not in nodes or n2 not in nodes:
+            continue
+        c1 = nodes[n1]
+        c2 = nodes[n2]
+        dx = abs(c1[0] - c2[0])
+        dz = abs(c1[2] - c2[2])
+        if dz > dx:
+            transverse_members.append(tag)
+        else:
+            longitudinal_members.append(tag)
+
+    # Fallback if model group queries returned empty
+    if not start_edge and not end_edge and not trans_slab and transverse_members:
+        trans_node_xs = [nodes[n][0] for e in transverse_members for n in members[e] if n in nodes]
+        if trans_node_xs:
+            min_x = min(trans_node_xs)
+            max_x = max(trans_node_xs)
+            tol = 0.05  # 50 mm
+            for e in transverse_members:
+                n1, n2 = members[e]
+                mx = (nodes[n1][0] + nodes[n2][0]) / 2.0
+                if abs(mx - min_x) <= tol:
+                    start_edge.append(e)
+                elif abs(mx - max_x) <= tol:
+                    end_edge.append(e)
+                else:
+                    trans_slab.append(e)
+
+    end_diaphragm_members = sorted(set(start_edge + end_edge))
+    cross_bracing_members = sorted(set(trans_slab))
+    all_trans = sorted(set(transverse_members + end_diaphragm_members + cross_bracing_members))
+    all_long = sorted(set(e for e in members if e not in all_trans))
+
+    grp["start_edge"] = sorted(set(start_edge))
+    grp["end_edge"] = sorted(set(end_edge))
+    grp["transverse_slab"] = sorted(set(trans_slab))
+
+    return {
+        "longitudinal_members": all_long,
+        "transverse_members": all_trans,
+        "end_diaphragm_members": end_diaphragm_members,
+        "cross_bracing_members": cross_bracing_members,
+        "start_edge": grp["start_edge"],
+        "end_edge": grp["end_edge"],
+        "transverse_slab": grp["transverse_slab"],
+        "groups": grp,
+    }
+
+
+def extract_transverse_chains(
+    nodes: dict,
+    members: dict,
+    transverse_tags: list[int] | None = None,
+    model=None,
+    groups: dict | None = None,
+) -> list[dict]:
+    """
+    Extract ordered transverse member chains (lines across bridge width).
+    Each chain represents an end diaphragm line or intermediate cross bracing line.
+
+    Returns a list of dicts:
+        [
+            {
+                "name": str,
+                "short_name": str,
+                "category": "end_diaphragm" | "cross_bracing",
+                "station_x": float,
+                "elements": list[int],
+                "nodes": list[int],
+                "xs": np.ndarray,
+                "ys": np.ndarray,
+                "zs": np.ndarray,
+            },
+            ...
+        ]
+    """
+    nodes = {int(k): list(map(float, v)) for k, v in nodes.items()}
+    members = {int(k): list(map(int, v)) for k, v in members.items()}
+
+    classification = classify_grillage_elements(nodes, members, model=model, groups=groups)
+    if transverse_tags is None:
+        transverse_tags = classification["transverse_members"]
+    transverse_set = set(int(t) for t in transverse_tags if int(t) in members)
+    if not transverse_set:
+        return []
+
+    end_diaphragm_set = set(classification["end_diaphragm_members"])
+
+    # Cluster transverse elements into stations (by midpoint X)
+    elem_info = []
+    for e in transverse_set:
+        n1, n2 = members[e]
+        if n1 not in nodes or n2 not in nodes:
+            continue
+        c1 = nodes[n1]
+        c2 = nodes[n2]
+        mid_x = (c1[0] + c2[0]) / 2.0
+        mid_z = (c1[2] + c2[2]) / 2.0
+        elem_info.append((e, mid_x, mid_z, n1, n2))
+
+    # Sort primarily by mid_x
+    elem_info.sort(key=lambda item: item[1])
+
+    # Group into station clusters within 0.08m tolerance
+    clusters: list[list[tuple]] = []
+    for item in elem_info:
+        if not clusters:
+            clusters.append([item])
+        else:
+            prev_station = np.mean([it[1] for it in clusters[-1]])
+            if abs(item[1] - prev_station) <= 0.08:
+                clusters[-1].append(item)
+            else:
+                clusters.append([item])
+
+    chains = []
+    station_xs = [float(np.mean([it[1] for it in cl])) for cl in clusters]
+    min_sx = min(station_xs) if station_xs else 0.0
+    max_sx = max(station_xs) if station_xs else 0.0
+
+    cb_idx = 1
+    for cl in clusters:
+        # Sort elements within cluster across bridge width by mid_z
+        cl.sort(key=lambda it: it[2])
+        station_x = round(float(np.mean([it[1] for it in cl])), 3)
+
+        ordered_elements = [it[0] for it in cl]
+
+        # Trace / order nodes along the transverse line
+        ordered_nodes = []
+        for e in ordered_elements:
+            n1, n2 = members[e]
+            if nodes[n1][2] > nodes[n2][2]:
+                n1, n2 = n2, n1
+            if not ordered_nodes:
+                ordered_nodes.extend([n1, n2])
+            else:
+                if n1 == ordered_nodes[-1]:
+                    ordered_nodes.append(n2)
+                elif n2 == ordered_nodes[-1]:
+                    ordered_nodes.append(n1)
+                else:
+                    if n1 not in ordered_nodes:
+                        ordered_nodes.append(n1)
+                    if n2 not in ordered_nodes:
+                        ordered_nodes.append(n2)
+
+        xs = np.array([nodes[n][0] for n in ordered_nodes])
+        ys = np.array([nodes[n][1] for n in ordered_nodes])
+        zs = np.array([nodes[n][2] for n in ordered_nodes])
+
+        is_end_diaphragm = (
+            any(e in end_diaphragm_set for e in ordered_elements)
+            or abs(station_x - min_sx) < 0.08
+            or abs(station_x - max_sx) < 0.08
+        )
+
+        if is_end_diaphragm:
+            category = "end_diaphragm"
+            if abs(station_x - min_sx) <= abs(station_x - max_sx):
+                name = f"End Diaphragm (Start - {station_x:.2f}m)"
+                short_name = "End Diaphragm 1"
+            else:
+                name = f"End Diaphragm (End - {station_x:.2f}m)"
+                short_name = "End Diaphragm 2"
+        else:
+            category = "cross_bracing"
+            name = f"Cross Bracing @ {station_x:.2f}m"
+            short_name = f"Cross Bracing {cb_idx} ({station_x:.2f}m)"
+            cb_idx += 1
+
+        chains.append({
+            "name": name,
+            "short_name": short_name,
+            "category": category,
+            "station_x": station_x,
+            "elements": ordered_elements,
+            "nodes": ordered_nodes,
+            "xs": xs,
+            "ys": ys,
+            "zs": zs,
+        })
+
+    return chains
+
+
+def extract_member_diagram_data(
+    ds,
+    member_selection: str,
+    component_key: str,
+    nodes: dict,
+    members: dict,
+    model=None,
+    edge_dist: float = 0.0,
+) -> tuple[list[dict], dict]:
+    """
+    Unified extraction router for longitudinal and transverse member diagram data.
+    Extracts all 9 internal forces and displacements:
+      - Forces:       Fx (axial), Fy (shear y), Fz (shear z), Mx (torsion), My (moment y), Mz (moment z)
+      - Displacements: Dx (dx), Dy (dy), Dz (dz)
+
+    Parameters
+    ----------
+    ds               : xarray.Dataset (must have 'forces' or 'displacements')
+    member_selection : str
+        "All", "G1", "G2", "Transverse Members", "End Diaphragms",
+        "Intermediate Cross Bracings", or specific chain name.
+    component_key    : str
+        "Fx", "Fy", "Fz", "Mx", "My", "Mz", "Dx", "Dy", "Dz", or aliases.
+    nodes            : dict — {node_id: [x, y, z]}
+    members          : dict — {elem_id: [n1, n2]}
+    model            : OspGrillage, optional
+    edge_dist        : float
+
+    Returns
+    -------
+    polylines    : list of polyline dicts
+    summary_data : dict of {name: {"max": float, "min": float}}
+    """
+    nodes = {int(k): list(map(float, v)) for k, v in nodes.items()}
+    members = {int(k): list(map(int, v)) for k, v in members.items()}
+
+    disp_aliases = {
+        "dx": "x", "dy": "y", "dz": "z",
+        "Dx": "x", "Dy": "y", "Dz": "z",
+        "x": "x", "y": "y", "z": "z",
+    }
+    force_aliases = {
+        "fx": ("Vx_i", "Vx_j"), "Fx": ("Vx_i", "Vx_j"),
+        "fy": ("Vy_i", "Vy_j"), "Fy": ("Vy_i", "Vy_j"), "vy": ("Vy_i", "Vy_j"), "Vy": ("Vy_i", "Vy_j"),
+        "fz": ("Vz_i", "Vz_j"), "Fz": ("Vz_i", "Vz_j"), "vz": ("Vz_i", "Vz_j"), "Vz": ("Vz_i", "Vz_j"),
+        "mx": ("Mx_i", "Mx_j"), "Mx": ("Mx_i", "Mx_j"), "tx": ("Mx_i", "Mx_j"), "Tx": ("Mx_i", "Mx_j"),
+        "my": ("My_i", "My_j"), "My": ("My_i", "My_j"),
+        "mz": ("Mz_i", "Mz_j"), "Mz": ("Mz_i", "Mz_j"),
+    }
+
+    is_displacement = component_key in disp_aliases
+    is_transverse_sel = (
+        member_selection in ("Transverse Members", "End Diaphragms", "Intermediate Cross Bracings")
+        or "Diaphragm" in member_selection
+        or "Cross Bracing" in member_selection
+        or member_selection.startswith("ED")
+        or member_selection.startswith("CB")
+    )
+
+    # 1. Resolve dataset components
+    actual_disp_comp = None
+    comp_i_name, comp_j_name = None, None
+
+    if is_displacement:
+        target_name = disp_aliases.get(component_key, component_key).lower()
+        if "displacements" in ds:
+            for c in ds["displacements"].coords["Component"].values:
+                if str(c).lower() == target_name:
+                    actual_disp_comp = c
+                    break
+    else:
+        fi, fj = force_aliases.get(component_key, ("Vy_i", "Vy_j"))
+        if "forces" in ds:
+            comp_vals = [str(c) for c in ds["forces"].coords["Component"].values]
+            for c in comp_vals:
+                if c.lower() == fi.lower():
+                    comp_i_name = c
+                if c.lower() == fj.lower():
+                    comp_j_name = c
+
+    # Helper: read displacement at node
+    def _get_node_disp(nid: int) -> float:
+        if actual_disp_comp is None or "displacements" not in ds:
+            return 0.0
+        try:
+            val = float(ds["displacements"].sel(Node=nid, Component=actual_disp_comp).values)
+            if str(actual_disp_comp).lower() in ("y", "z"):
+                val = -val  # engineering sign flip for sag
+            return val * 1000.0  # m -> mm
+        except Exception:
+            return 0.0
+
+    # Helper: read force at element
+    def _get_elem_forces(eid: int) -> tuple[float, float]:
+        if "forces" not in ds or comp_i_name is None or comp_j_name is None:
+            return 0.0, 0.0
+        try:
+            vi = float(ds["forces"].sel(Element=eid, Component=comp_i_name).values) / 1000.0
+            vj = float(ds["forces"].sel(Element=eid, Component=comp_j_name).values) / 1000.0
+            return vi, vj
+        except Exception:
+            return 0.0, 0.0
+
+    polylines = []
+    summary_data = {}
+
+    if is_transverse_sel:
+        all_chains = extract_transverse_chains(nodes, members, model=model)
+        for chain in all_chains:
+            if member_selection == "End Diaphragms" and chain["category"] != "end_diaphragm":
+                continue
+            if member_selection == "Intermediate Cross Bracings" and chain["category"] != "cross_bracing":
+                continue
+            if member_selection not in ("Transverse Members", "End Diaphragms", "Intermediate Cross Bracings"):
+                if member_selection != chain["name"] and member_selection != chain["short_name"]:
+                    continue
+
+            ordered_elems = chain["elements"]
+            ordered_nodes = chain["nodes"]
+
+            if is_displacement:
+                vals = [_get_node_disp(n) for n in ordered_nodes]
+            else:
+                vals = []
+                for idx, e in enumerate(ordered_elems):
+                    vi, vj = _get_elem_forces(e)
+                    vals.append(vi)
+                    if idx == len(ordered_elems) - 1:
+                        vals.append(-vj if component_key in ("Fy", "Fz", "Fx", "Vy", "Vz") else vj)
+
+            vals_arr = np.array(vals, dtype=float)
+            polyline_entry = {
+                "name": chain["short_name"],
+                "full_name": chain["name"],
+                "category": "transverse",
+                "sub_category": chain["category"],
+                "is_transverse": True,
+                "station_x": chain["station_x"],
+                "elements": ordered_elems,
+                "node_ids": ordered_nodes,
+                "xs": chain["xs"],
+                "ys": chain["ys"],
+                "zs": chain["zs"],
+                "vals": vals_arr,
+                "is_edge": False,
+            }
+            polylines.append(polyline_entry)
+            if vals_arr.size:
+                summary_data[chain["short_name"]] = {
+                    "max": float(np.max(vals_arr)),
+                    "min": float(np.min(vals_arr)),
+                }
+
+    else:
+        # Longitudinal girders
+        node_z = {n: round(coord[2], 3) for n, coord in nodes.items()}
+        girders_map = defaultdict(list)
+        for ele, (n1, n2) in members.items():
+            if n1 in node_z and n2 in node_z and node_z[n1] == node_z[n2]:
+                girders_map[node_z[n1]].append(ele)
+        for z_val in girders_map:
+            girders_map[z_val].sort(key=lambda e: nodes[members[e][0]][0])
+
+        girder_items = sorted(girders_map.items())
+        n_girders = len(girder_items)
+
+        for i, (z_val, elems) in enumerate(girder_items):
+            is_edge_beam = edge_dist > 0 and (i == 0 or i == n_girders - 1)
+            girder_name = f"G{i}" if edge_dist > 0 else f"G{i + 1}"
+
+            if member_selection != "All" and girder_name != member_selection:
+                continue
+
+            node_list = [members[e][0] for e in elems] + [members[elems[-1]][1]]
+            xs = np.array([nodes[n][0] for n in node_list])
+            ys = np.array([nodes[n][1] for n in node_list])
+            zs = np.array([nodes[n][2] for n in node_list])
+
+            if is_displacement:
+                vals = [_get_node_disp(n) for n in node_list]
+            else:
+                vals = []
+                for idx, e in enumerate(elems):
+                    vi, vj = _get_elem_forces(e)
+                    vals.append(vi)
+                    if idx == len(elems) - 1:
+                        vals.append(-vj if component_key in ("Fy", "Fz", "Fx", "Vy", "Vz") else vj)
+
+            vals_arr = np.array(vals, dtype=float)
+            polyline_entry = {
+                "name": girder_name,
+                "full_name": girder_name,
+                "category": "longitudinal",
+                "sub_category": "edge_beam" if is_edge_beam else "girder",
+                "is_transverse": False,
+                "station_x": None,
+                "elements": elems,
+                "node_ids": node_list,
+                "xs": xs,
+                "ys": ys,
+                "zs": zs,
+                "vals": vals_arr,
+                "is_edge": is_edge_beam,
+            }
+            polylines.append(polyline_entry)
+            if (not is_edge_beam) and vals_arr.size:
+                summary_data[girder_name] = {
+                    "max": float(np.max(vals_arr)),
+                    "min": float(np.min(vals_arr)),
+                }
+
+    return polylines, summary_data
 
 
 def dump_full_data(
@@ -408,25 +863,22 @@ def _build_full_data(model, edge_dist: float = 0.0, dataset=None, lazy: bool = F
     disp_components = [str(
         c) for c in ds0["displacements"].coords["Component"].values] if "displacements" in ds0.data_vars else []
 
-    # Classify members: longitudinal = both nodes share same Z and same Y
-    _z_tol = 1e-3
-    longitudinal_members = []
-    transverse_members = []
-    for tag, (n1, n2) in members.items():
-        if n1 not in nodes or n2 not in nodes:
-            continue
-        if (abs(nodes[n1][2] - nodes[n2][2]) < _z_tol and
-                abs(nodes[n1][1] - nodes[n2][1]) < _z_tol):
-            longitudinal_members.append(tag)
-        else:
-            transverse_members.append(tag)
+    # Classify elements into longitudinal, transverse, end diaphragms, and cross bracings
+    classification = classify_grillage_elements(nodes, members, model=model, groups=groups)
+    transverse_chains = extract_transverse_chains(nodes, members, model=model, groups=classification["groups"])
 
     data: dict = {
         "nodes": {str(k): list(v) for k, v in nodes.items()},
         "members": {str(k): list(v) for k, v in members.items()},
-        "groups": groups,
-        "longitudinal_members": longitudinal_members,
-        "transverse_members": transverse_members,
+        "groups": classification["groups"],
+        "longitudinal_members": classification["longitudinal_members"],
+        "transverse_members": classification["transverse_members"],
+        "end_diaphragm_members": classification["end_diaphragm_members"],
+        "cross_bracing_members": classification["cross_bracing_members"],
+        "start_edge": classification["start_edge"],
+        "end_edge": classification["end_edge"],
+        "transverse_slab": classification["transverse_slab"],
+        "transverse_chains": transverse_chains,
         "edge_dist": float(edge_dist),
         "loadcases": list(loadcases),
         "force_components": force_components,
